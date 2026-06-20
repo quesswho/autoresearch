@@ -17,11 +17,34 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+# FlashAttention-3 is a Hopper (sm_90) kernel with no Windows build. Only load it on
+# Hopper; everywhere else (Ampere/Ada, Windows, ...) fall back to PyTorch SDPA below.
+USE_FA3 = cap == (9, 0)
+if USE_FA3:
+    from kernels import get_kernel
+    fa3 = get_kernel("varunneal/flash-attention-3").flash_attn_interface
+else:
+    fa3 = None
+
+
+def sdpa_attention(q, k, v, window_size):
+    """FA3-compatible attention via PyTorch SDPA. q: [B,T,Hq,D], k/v: [B,T,Hkv,D]."""
+    B, T, Hq, D = q.shape
+    w = window_size[0]  # FA3 window_size=(left, right); these layers always use right=0
+    q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # -> [B,H,T,D]
+    enable_gqa = q.shape[2] != k.shape[2]
+    if w >= T - 1:
+        # full causal window: use the flash fast path, no explicit mask needed
+        attn_mask, is_causal = None, True
+    else:
+        # banded sliding window: query i attends to keys in [i-w, i]
+        idx = torch.arange(T, device=q.device)
+        attn_mask = (idx[None, :] <= idx[:, None]) & (idx[None, :] >= idx[:, None] - w)
+        is_causal = False
+    y = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_mask,
+                                       is_causal=is_causal, enable_gqa=enable_gqa)
+    return y.transpose(1, 2)  # -> [B,T,Hq,D]
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -90,7 +113,10 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if fa3 is not None:
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            y = sdpa_attention(q, k, v, window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y

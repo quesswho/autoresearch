@@ -1,26 +1,31 @@
 """
 One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+
+Downloads the BabyLM 2026 Strict-Small corpus (10M words of developmentally
+plausible text), materializes parquet shards (train + a held-out validation
+shard), and trains a morphology-based tokenizer (Morfessor).
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py                  # full prep (download + shards + tokenizer)
 
 Data and tokenizer are stored in ~/.cache/autoresearch/.
 """
 
 import os
+import re
 import sys
 import time
 import math
+import random
 import argparse
 import pickle
+import collections
 from multiprocessing import Pool
 
 import requests
+import pyarrow as pa
 import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
+import morfessor
 import torch
 
 # ---------------------------------------------------------------------------
@@ -29,35 +34,62 @@ import torch
 
 MAX_SEQ_LEN = 2048       # context length
 TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+EVAL_TOKENS = 2 * 524288  # ~1.05M tokens for val eval (BabyLM held-out set is small)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
+RAW_DIR = os.path.join(CACHE_DIR, "babylm_raw")    # raw BabyLM .txt corpora
+DATA_DIR = os.path.join(CACHE_DIR, "data")          # materialized parquet shards
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
+
+# BabyLM 2026 Strict-Small corpus (10M words of developmentally plausible text).
+# https://huggingface.co/datasets/BabyLM-community/BabyLM-2026-Strict-Small
+BASE_URL = "https://huggingface.co/datasets/BabyLM-community/BabyLM-2026-Strict-Small/resolve/main"
+BABYLM_FILES = [
+    "childes.train.txt",
+    "gutenberg.train.txt",
+    "open_subtitles.train.txt",
+    "simple_wiki.train.txt",
+    "bnc_spoken.train.txt",
+    "switchboard.train.txt",
+]
+
+# Shard layout. The raw corpora are plain text (one document per line). We
+# deterministically shuffle the documents, hold out a validation slice, and
+# write parquet shards with a single "text" column — the format the rest of the
+# pipeline (tokenizer training, dataloader, evaluation) already expects.
+SHUFFLE_SEED = 1337
+VAL_FRAC = 0.1                  # fraction of documents held out for validation
+NUM_TRAIN_SHARDS = 8
+VAL_SHARD = NUM_TRAIN_SHARDS    # pinned validation shard (highest index)
 VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
+SHARD_ROW_GROUP_SIZE = 10_000
+
 VOCAB_SIZE = 8192
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+# Morphology tokenizer config.
+# Words (runs of unicode letters) are segmented into morphemes by a Morfessor
+# model; everything else (whitespace, punctuation, digits) and any morpheme not
+# in the vocabulary falls back to raw UTF-8 bytes, which keeps the tokenizer
+# fully lossless. Byte ids occupy 0..255, morpheme ids follow, special tokens
+# come last.
+WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)   # maximal runs of unicode letters
+NUM_BYTE_TOKENS = 256                             # raw byte fallback (0..255)
+MIN_WORD_COUNT = 2                                # drop hapax words from tokenizer training
 
 SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
 BOS_TOKEN = "<|reserved_0|>"
 
 # ---------------------------------------------------------------------------
-# Data download
+# Data download + shard materialization
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
+def download_single_file(filename):
+    """Download one raw BabyLM .txt file with retries. Returns True on success."""
+    filepath = os.path.join(RAW_DIR, filename)
     if os.path.exists(filepath):
         return True
 
@@ -88,29 +120,77 @@ def download_single_shard(index):
     return False
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
+def download_data(download_workers=6):
+    """Download the raw BabyLM .txt corpora."""
+    os.makedirs(RAW_DIR, exist_ok=True)
+    existing = sum(1 for f in BABYLM_FILES if os.path.exists(os.path.join(RAW_DIR, f)))
+    if existing == len(BABYLM_FILES):
+        print(f"Data: all {len(BABYLM_FILES)} raw files already downloaded at {RAW_DIR}")
         return
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+    needed = len(BABYLM_FILES) - existing
+    print(f"Data: downloading {needed} raw files ({existing} already exist)...")
 
     workers = max(1, min(download_workers, needed))
     with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
+        results = pool.map(download_single_file, BABYLM_FILES)
 
     ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+    print(f"Data: {ok}/{len(BABYLM_FILES)} raw files ready at {RAW_DIR}")
+    if ok != len(BABYLM_FILES):
+        print("Data: some files failed to download — cannot continue.")
+        sys.exit(1)
+
+
+def _read_all_documents():
+    """Read every non-empty line across all raw corpora as a list of documents."""
+    docs = []
+    for filename in BABYLM_FILES:
+        filepath = os.path.join(RAW_DIR, filename)
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    docs.append(line)
+    return docs
+
+
+def _write_shard(docs, index):
+    """Write a list of documents to shard_{index}.parquet with a 'text' column."""
+    table = pa.table({"text": docs})
+    filepath = os.path.join(DATA_DIR, f"shard_{index:05d}.parquet")
+    pq.write_table(table, filepath, row_group_size=SHARD_ROW_GROUP_SIZE)
+    return len(docs)
+
+
+def build_shards():
+    """Shuffle documents, hold out a validation slice, write parquet shards."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    train_paths = [os.path.join(DATA_DIR, f"shard_{i:05d}.parquet") for i in range(NUM_TRAIN_SHARDS)]
+    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
+    if all(os.path.exists(p) for p in train_paths) and os.path.exists(val_path):
+        print(f"Shards: already materialized at {DATA_DIR}")
+        return
+
+    print("Shards: reading raw documents...")
+    docs = _read_all_documents()
+    rng = random.Random(SHUFFLE_SEED)
+    rng.shuffle(docs)
+
+    n_val = int(len(docs) * VAL_FRAC)
+    val_docs = docs[:n_val]
+    train_docs = docs[n_val:]
+    print(f"Shards: {len(train_docs):,} train docs, {len(val_docs):,} val docs")
+
+    nval = _write_shard(val_docs, VAL_SHARD)
+    print(f"  Wrote {VAL_FILENAME} ({nval:,} docs)")
+
+    chunk = math.ceil(len(train_docs) / NUM_TRAIN_SHARDS)
+    for i in range(NUM_TRAIN_SHARDS):
+        part = train_docs[i * chunk:(i + 1) * chunk]
+        n = _write_shard(part, i)
+        print(f"  Wrote shard_{i:05d}.parquet ({n:,} docs)")
+    print(f"Shards: done, materialized at {DATA_DIR}")
 
 # ---------------------------------------------------------------------------
 # Tokenizer training
@@ -139,7 +219,7 @@ def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
 
 
 def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
+    """Train a Morfessor morphology tokenizer, save vocab + model as a pickle."""
     tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
     token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
 
@@ -151,89 +231,143 @@ def train_tokenizer():
 
     parquet_files = list_parquet_files()
     if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
+        print("Tokenizer: no parquet shards found (need 1 train + 1 val). Run prepare.py first.")
         sys.exit(1)
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
+    # --- Count words across the training split ---
+    print("Tokenizer: counting words...")
     t0 = time.time()
+    word_counts = collections.Counter()
+    for doc in text_iterator():
+        word_counts.update(WORD_RE.findall(doc))
+    print(f"Tokenizer: {len(word_counts):,} unique words")
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+    # --- Train Morfessor on the word types ---
+    print("Tokenizer: training Morfessor model...")
+    model = morfessor.BaselineModel()
+    model.load_data([(c, tuple(w)) for w, c in word_counts.items()],
+                    freqthreshold=MIN_WORD_COUNT)
+    model.train_batch()
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
+    # --- Rank morphemes by corpus frequency and select the vocabulary ---
+    # Single-byte (ASCII) morphemes are already covered by the byte fallback,
+    # so we don't spend vocab slots on them.
+    morph_freq = collections.Counter()
+    for word, count in word_counts.items():
+        for atoms in model.viterbi_segment(tuple(word))[0]:
+            morph_freq["".join(atoms)] += count
 
-    # Save tokenizer
+    morph_budget = VOCAB_SIZE - NUM_BYTE_TOKENS - len(SPECIAL_TOKENS)
+    morphs = []
+    for morph, _ in morph_freq.most_common():
+        if len(morph.encode("utf-8")) == 1:
+            continue
+        morphs.append(morph)
+        if len(morphs) >= morph_budget:
+            break
+
+    # --- Assemble the id space: [bytes | morphs | specials] ---
+    morph_to_id = {morph: NUM_BYTE_TOKENS + i for i, morph in enumerate(morphs)}
+    specials_offset = NUM_BYTE_TOKENS + len(morphs)
+    special_tokens = {name: specials_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
+    n_vocab = specials_offset + len(SPECIAL_TOKENS)
+
+    state = {
+        "morph_to_id": morph_to_id,
+        "special_tokens": special_tokens,
+        "n_vocab": n_vocab,
+        "model": model,
+    }
     with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
+        pickle.dump(state, f)
 
     t1 = time.time()
     print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
 
     # --- Build token_bytes lookup for BPB evaluation ---
     print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
+    token_bytes_list = [1] * NUM_BYTE_TOKENS                    # each byte token is 1 byte
+    token_bytes_list += [len(m.encode("utf-8")) for m in morphs]
+    token_bytes_list += [0] * len(SPECIAL_TOKENS)              # specials have no byte content
     token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
     torch.save(token_bytes_tensor, token_bytes_path)
     print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
 
     # Sanity check
+    tok = Tokenizer.from_directory()
     test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
+    decoded = tok.decode(tok.encode(test))
     assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+    print(f"Tokenizer: sanity check passed (vocab_size={tok.get_vocab_size()})")
 
 # ---------------------------------------------------------------------------
 # Runtime utilities (imported by train.py)
 # ---------------------------------------------------------------------------
 
 class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
+    """Morphology tokenizer. Words are split into morphemes by Morfessor; all
+    other text and out-of-vocabulary morphemes fall back to raw UTF-8 bytes, so
+    encoding is fully lossless. Training is handled by train_tokenizer above."""
 
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
+    def __init__(self, state):
+        self.model = state["model"]
+        self.morph_to_id = state["morph_to_id"]
+        self.special_tokens = state["special_tokens"]
+        self.n_vocab = state["n_vocab"]
+        # id -> string for the non-byte ids (morphemes and specials), used by decode.
+        self.id_to_str = {tid: morph for morph, tid in self.morph_to_id.items()}
+        self.id_to_str.update({tid: name for name, tid in self.special_tokens.items()})
+        self.bos_token_id = self.special_tokens[BOS_TOKEN]
+        self._word_cache = {}
 
     @classmethod
     def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
         with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
+            state = pickle.load(f)
+        return cls(state)
 
     def get_vocab_size(self):
-        return self.enc.n_vocab
+        return self.n_vocab
 
     def get_bos_token_id(self):
         return self.bos_token_id
 
+    def _encode_word(self, word):
+        ids = self._word_cache.get(word)
+        if ids is not None:
+            return ids
+        ids = []
+        for atoms in self.model.viterbi_segment(tuple(word))[0]:
+            morph = "".join(atoms)
+            tid = self.morph_to_id.get(morph)
+            if tid is not None:
+                ids.append(tid)
+            else:
+                ids.extend(morph.encode("utf-8"))   # byte ids are the byte values 0..255
+        self._word_cache[word] = ids
+        return ids
+
+    def _encode_ordinary(self, text):
+        ids = []
+        pos = 0
+        for m in WORD_RE.finditer(text):
+            if m.start() > pos:
+                ids.extend(text[pos:m.start()].encode("utf-8"))
+            ids.extend(self._encode_word(m.group()))
+            pos = m.end()
+        if pos < len(text):
+            ids.extend(text[pos:].encode("utf-8"))
+        return ids
+
     def encode(self, text, prepend=None, num_threads=8):
         if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
+            prepend_id = prepend if isinstance(prepend, int) else self.special_tokens[prepend]
         if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
+            ids = self._encode_ordinary(text)
             if prepend is not None:
                 ids.insert(0, prepend_id)
         elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
+            ids = [self._encode_ordinary(t) for t in text]
             if prepend is not None:
                 for row in ids:
                     row.insert(0, prepend_id)
@@ -242,7 +376,19 @@ class Tokenizer:
         return ids
 
     def decode(self, ids):
-        return self.enc.decode(ids)
+        out = []
+        buf = bytearray()
+        for tid in ids:
+            if tid < NUM_BYTE_TOKENS:
+                buf.append(tid)
+            else:
+                if buf:
+                    out.append(buf.decode("utf-8", errors="replace"))
+                    buf.clear()
+                out.append(self.id_to_str[tid])
+        if buf:
+            out.append(buf.decode("utf-8", errors="replace"))
+        return "".join(out)
 
 
 def get_token_bytes(device="cpu"):
@@ -369,21 +515,22 @@ def evaluate_bpb(model, tokenizer, batch_size):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(description="Prepare BabyLM data and tokenizer for autoresearch")
+    parser.add_argument("--download-workers", type=int, default=6, help="Number of parallel download workers")
     args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
 
     print(f"Cache directory: {CACHE_DIR}")
     print()
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
+    # Step 1: Download raw BabyLM corpora
+    download_data(download_workers=args.download_workers)
     print()
 
-    # Step 2: Train tokenizer
+    # Step 2: Materialize parquet shards (train + pinned val)
+    build_shards()
+    print()
+
+    # Step 3: Train tokenizer
     train_tokenizer()
     print()
     print("Done! Ready to train.")
