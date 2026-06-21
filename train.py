@@ -7,6 +7,10 @@ Usage: uv run train.py
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+# Windows MAX_PATH (260 char) workaround: torch.compile's fused-kernel filenames are
+# very long, so keep the inductor/triton cache roots short to stay under the limit.
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", r"E:\tc\ind")
+os.environ.setdefault("TRITON_CACHE_DIR", r"E:\tc\tri")
 
 import gc
 import math
@@ -461,7 +465,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 16  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
