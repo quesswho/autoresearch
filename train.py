@@ -578,7 +578,8 @@ while True:
         x, y, epoch = next(train_loader)
 
     # Detect epoch rollover (epoch is the epoch of the next, prefetched batch)
-    if epoch != current_epoch:
+    epoch_rolled = epoch != current_epoch
+    if epoch_rolled:
         if steps_per_epoch is None:
             steps_per_epoch = step - epoch_start_step
         current_epoch = epoch
@@ -630,6 +631,19 @@ while True:
         gc.disable()
     elif (step + 1) % 5000 == 0:
         gc.collect()
+
+    # Periodic validation: at each epoch boundary, eval val_bpb to get a train/val
+    # curve for diagnosing under/overfitting. Runs OUTSIDE the timed region (after
+    # t1/dt above), so training_seconds/MFU/peak_vram stay clean. The model has no
+    # dropout/BN so eval()/train() is functionally a no-op; evaluate_bpb uses a
+    # separate val loader + torch.no_grad and does not touch the train iterator, so
+    # training stays deterministic. Final epoch is covered by the post-loop eval.
+    if epoch_rolled and epoch <= MAX_EPOCHS:
+        model.eval()
+        with autocast_ctx:
+            val_bpb_check = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+        model.train()
+        print(f"\nval @ epoch {epoch - 1}: val_bpb={val_bpb_check:.6f} | train_loss={debiased_smooth_loss:.6f}")
 
     step += 1
 
