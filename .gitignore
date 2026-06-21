@@ -24,3 +24,6 @@ results.tsv
 
 # Model checkpoints (large; saved per run)
 checkpoints/
+
+# Vendored BabyLM eval harness (external; clone of babylm-org/babylm-eval)
+babylm-eval/
