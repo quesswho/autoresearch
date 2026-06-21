@@ -561,6 +561,15 @@ smooth_train_loss = 0
 total_training_time = 0
 step = 0
 
+# SWA (Stochastic Weight Averaging): uniformly average the weights over the back
+# half of training and evaluate that average as the final model. The val curve shows
+# the model bottoms mid-training (~epoch 6-7) then overfits; SWA recovers a flatter
+# minimum from the trajectory. RMSNorm is parameter-free (no BatchNorm running stats),
+# so no recalibration pass is needed after averaging.
+SWA_START = 0.5  # begin averaging once progress >= this fraction of training
+swa_params = [torch.zeros_like(p, dtype=torch.float32) for p in model.parameters()]
+swa_count = 0
+
 # Epoch tracking for progress-based schedules. `epoch` is the epoch of the next
 # (prefetched) batch; it rolls over to MAX_EPOCHS+1 once the corpus has been seen
 # MAX_EPOCHS times. steps_per_epoch is learned after the first epoch completes and
@@ -648,6 +657,13 @@ while True:
         model.train()
         print(f"\nval @ epoch {epoch - 1}: val_bpb={val_bpb_check:.6f} | train_loss={debiased_smooth_loss:.6f}")
 
+    # SWA: accumulate weight snapshots over the back half (outside the timed region).
+    if progress >= SWA_START:
+        with torch.no_grad():
+            for swa, p in zip(swa_params, model.parameters()):
+                swa.add_(p)
+        swa_count += 1
+
     step += 1
 
     # Stop once the corpus has been seen MAX_EPOCHS times (the next batch would be
@@ -659,8 +675,18 @@ print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
-# Final eval
+# Final eval. First eval the raw final weights (for comparison), then load the SWA
+# average and use THAT as the official metric (captures the flatter back-half minimum).
 model.eval()
+with autocast_ctx:
+    val_bpb_raw = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+print(f"val_bpb_raw:      {val_bpb_raw:.6f}  (final weights, pre-SWA)")
+
+if swa_count > 0:
+    with torch.no_grad():
+        for swa, p in zip(swa_params, model.parameters()):
+            p.copy_(swa / swa_count)
+
 with autocast_ctx:
     val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
 
