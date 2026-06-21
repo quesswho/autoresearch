@@ -5,6 +5,7 @@ Usage: uv run train.py
 """
 
 import os
+import sys
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 # Windows MAX_PATH (260 char) workaround: torch.compile's fused-kernel filenames are
@@ -708,3 +709,23 @@ checkpoint = {
 ckpt_path = os.path.join(ckpt_dir, f"{commit}.pt")
 torch.save(checkpoint, ckpt_path)
 print(f"checkpoint:       {ckpt_path}")
+
+# ---------------------------------------------------------------------------
+# Archive this run's log, tagged by the same git commit as the checkpoint.
+# The launcher convention is `uv run train.py > run.log 2>&1`, so run.log is
+# the live scratch log that gets overwritten each run. Copy it to a durable
+# per-commit location so completed experiments keep their full log. Keyed by
+# `commit` (not HEAD-at-archive-time) so it always matches the run that
+# produced it and never collides with a later/other running experiment. Runs
+# only here at end-of-run, so an in-flight run's log is never archived early.
+# ---------------------------------------------------------------------------
+repo_dir = os.path.dirname(os.path.abspath(__file__))
+src_log = os.path.join(repo_dir, "run.log")
+if commit != "nocommit" and os.path.exists(src_log):
+    import shutil
+    log_dir = os.path.join(repo_dir, "logs")  # repo-local (gitignored)
+    os.makedirs(log_dir, exist_ok=True)
+    dst_log = os.path.join(log_dir, f"{commit}.log")
+    sys.stdout.flush()  # ensure the final summary lines are in run.log before copying
+    shutil.copyfile(src_log, dst_log)
+    print(f"log archived:     {dst_log}")

@@ -25,5 +25,9 @@ results.tsv
 # Model checkpoints (large; saved per run)
 checkpoints/
 
+# Per-run logs (run.log archived as logs/<commit>.log at end of each run)
+run.log
+logs/
+
 # Vendored BabyLM eval harness (external; clone of babylm-org/babylm-eval)
 babylm-eval/
