@@ -33,7 +33,7 @@ import torch
 # ---------------------------------------------------------------------------
 
 MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
+MAX_EPOCHS = 10          # training stops after this many passes over the corpus
 EVAL_TOKENS = 2 * 524288  # ~1.05M tokens for val eval (BabyLM held-out set is small)
 
 # ---------------------------------------------------------------------------

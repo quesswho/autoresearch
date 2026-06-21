@@ -17,21 +17,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-cap = torch.cuda.get_device_capability()
-# FlashAttention-3 is a Hopper (sm_90) kernel with no Windows build. Only load it on
-# Hopper; everywhere else (Ampere/Ada, Windows, ...) fall back to PyTorch SDPA below.
-USE_FA3 = cap == (9, 0)
-if USE_FA3:
-    from kernels import get_kernel
-    fa3 = get_kernel("varunneal/flash-attention-3").flash_attn_interface
-else:
-    fa3 = None
-
-
 def sdpa_attention(q, k, v, window_size):
-    """FA3-compatible attention via PyTorch SDPA. q: [B,T,Hq,D], k/v: [B,T,Hkv,D]."""
+    """Causal (optionally sliding-window) attention via PyTorch SDPA.
+    q: [B,T,Hq,D], k/v: [B,T,Hkv,D]."""
     B, T, Hq, D = q.shape
-    w = window_size[0]  # FA3 window_size=(left, right); these layers always use right=0
+    w = window_size[0]  # window_size=(left, right); these layers always use right=0
     q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # -> [B,H,T,D]
     enable_gqa = q.shape[2] != k.shape[2]
     if w >= T - 1:
@@ -46,7 +36,7 @@ def sdpa_attention(q, k, v, window_size):
                                        is_causal=is_causal, enable_gqa=enable_gqa)
     return y.transpose(1, 2)  # -> [B,T,Hq,D]
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from prepare import MAX_SEQ_LEN, MAX_EPOCHS, Tokenizer, make_dataloader, evaluate_bpb
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -54,12 +44,12 @@ from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evalua
 
 @dataclass
 class GPTConfig:
-    sequence_len: int = 2048
-    vocab_size: int = 32768
-    n_layer: int = 12
+    sequence_len: int = 256
+    vocab_size: int = 8192
+    n_layer: int = 10
     n_head: int = 6
     n_kv_head: int = 6
-    n_embd: int = 768
+    n_embd: int = 384
     window_pattern: str = "SSSL"
 
 
@@ -113,10 +103,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        if fa3 is not None:
-            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        else:
-            y = sdpa_attention(q, k, v, window_size)
+        y = sdpa_attention(q, k, v, window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -468,8 +455,8 @@ MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
+WARMUP_RATIO = 0.0      # fraction of total training for LR warmup
+WARMDOWN_RATIO = 0.5    # fraction of total training for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
@@ -486,7 +473,8 @@ torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+# Ampere BF16 tensor-core peak (RTX 3060, FP32 accumulate), used for MFU reporting.
+AMPERE_BF16_PEAK_FLOPS = 25.5e12
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -536,10 +524,10 @@ model = torch.compile(model, dynamic=False)
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
-print(f"Time budget: {TIME_BUDGET}s")
+print(f"Max epochs: {MAX_EPOCHS}")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
-# Schedules (all based on progress = training_time / TIME_BUDGET)
+# Schedules (all based on progress = epochs_completed / MAX_EPOCHS)
 
 def get_lr_multiplier(progress):
     if progress < WARMUP_RATIO:
@@ -566,6 +554,14 @@ smooth_train_loss = 0
 total_training_time = 0
 step = 0
 
+# Epoch tracking for progress-based schedules. `epoch` is the epoch of the next
+# (prefetched) batch; it rolls over to MAX_EPOCHS+1 once the corpus has been seen
+# MAX_EPOCHS times. steps_per_epoch is learned after the first epoch completes and
+# is exact thereafter (the data order is deterministic).
+current_epoch = epoch
+epoch_start_step = 0
+steps_per_epoch = None
+
 while True:
     torch.cuda.synchronize()
     t0 = time.time()
@@ -577,8 +573,17 @@ while True:
         loss.backward()
         x, y, epoch = next(train_loader)
 
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    # Detect epoch rollover (epoch is the epoch of the next, prefetched batch)
+    if epoch != current_epoch:
+        if steps_per_epoch is None:
+            steps_per_epoch = step - epoch_start_step
+        current_epoch = epoch
+        epoch_start_step = step
+
+    # Progress through training as a fraction of MAX_EPOCHS (drives LR/WD schedules).
+    # During the first epoch the length is unknown, so the in-epoch fraction stays 0.
+    frac_in_epoch = 0.0 if steps_per_epoch is None else min((step - epoch_start_step) / steps_per_epoch, 1.0)
+    progress = min((epoch - 1 + frac_in_epoch) / MAX_EPOCHS, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
@@ -610,10 +615,9 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / AMPERE_BF16_PEAK_FLOPS
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch}/{MAX_EPOCHS}    ", end="", flush=True)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -625,8 +629,9 @@ while True:
 
     step += 1
 
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    # Stop once the corpus has been seen MAX_EPOCHS times (the next batch would be
+    # the start of epoch MAX_EPOCHS+1).
+    if epoch > MAX_EPOCHS:
         break
 
 print()  # newline after \r training log
@@ -641,7 +646,7 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / AMPERE_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
@@ -652,5 +657,6 @@ print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
 print(f"mfu_percent:      {steady_state_mfu:.2f}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
+print(f"epochs:           {MAX_EPOCHS}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
