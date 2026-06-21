@@ -664,3 +664,31 @@ print(f"num_steps:        {step}")
 print(f"epochs:           {MAX_EPOCHS}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+# ---------------------------------------------------------------------------
+# Save checkpoint (state_dict + config + metadata), tagged by git commit hash.
+# HF/babylm-eval export is handled separately from this raw checkpoint.
+# ---------------------------------------------------------------------------
+import subprocess
+try:
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+    ).decode().strip()
+except Exception:
+    commit = "nocommit"
+
+ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")  # repo-local (gitignored)
+os.makedirs(ckpt_dir, exist_ok=True)
+raw_model = getattr(model, "_orig_mod", model)  # unwrap torch.compile
+checkpoint = {
+    "model_state_dict": raw_model.state_dict(),
+    "config": asdict(config),
+    "depth": DEPTH,
+    "vocab_size": vocab_size,
+    "val_bpb": val_bpb,
+    "commit": commit,
+}
+ckpt_path = os.path.join(ckpt_dir, f"{commit}.pt")
+torch.save(checkpoint, ckpt_path)
+print(f"checkpoint:       {ckpt_path}")
