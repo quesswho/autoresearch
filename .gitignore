@@ -19,8 +19,9 @@ AGENTS.md
 # Experimental code/artifacts
 dev/
 
-# Results file
+# Results files (local experiment logs: val_bpb + benchmark scores)
 results.tsv
+eval_results.tsv
 
 # Model checkpoints (large; saved per run)
 checkpoints/

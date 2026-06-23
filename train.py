@@ -149,6 +149,12 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # MTP: light per-offset projections; head j logits = lm_head(norm(mtp_proj[j-1](x))).
+        # Empty (no params) when MTP is off -> model is byte-identical to the STP baseline.
+        self.mtp_proj = nn.ModuleList(
+            [nn.Linear(config.n_embd, config.n_embd, bias=False) for _ in range(MTP_K - 1)]
+            if (MTP_ENABLE and MTP_K > 1) else []
+        )
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
@@ -169,6 +175,10 @@ class GPT(nn.Module):
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        # MTP projections start as identity: each t+k head begins as a copy of the
+        # t+1 predictor (lm_head(norm(x))) and specializes to the further offset.
+        for proj in self.mtp_proj:
+            torch.nn.init.eye_(proj.weight)
         # Transformer blocks
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5
@@ -254,7 +264,9 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        # MTP projection matrices join the Muon-optimized matrix group (grouped by
+        # shape below); empty when MTP is off. Keeps the param-count assert balanced.
+        matrix_params = list(self.transformer.h.parameters()) + list(self.mtp_proj.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -283,7 +295,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, reduction='mean'):
+    def forward(self, idx, targets=None, reduction='mean', mtp_weight=0.0):
         B, T = idx.size()
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
@@ -305,6 +317,18 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                    ignore_index=-1, reduction=reduction)
+            # MTP auxiliary heads: predict t+1+j from the same final hidden x, scaled
+            # by mtp_weight (schedule-gated; 0.0 disables). Targets shift left by j and
+            # the last j positions become ignore_index (no cross-row look-ahead).
+            if MTP_ENABLE and mtp_weight != 0:
+                for j, proj in enumerate(self.mtp_proj, start=1):
+                    tj = torch.full_like(targets, -1)
+                    tj[:, :-j] = targets[:, j:]
+                    lj = self.lm_head(norm(proj(x))).float()
+                    lj = softcap * torch.tanh(lj / softcap)
+                    aux = F.cross_entropy(lj.view(-1, lj.size(-1)), tj.view(-1),
+                                          ignore_index=-1, reduction=reduction)
+                    loss = loss + mtp_weight * aux
             return loss
         return logits
 
@@ -476,6 +500,18 @@ SLW_ENABLE = True
 SLW_START = 256          # initial context length (power of 2 dividing MAX_SEQ_LEN)
 SLW_WARMUP_FRAC = 0.5    # ramp SLW_START -> MAX_SEQ_LEN over the first this fraction of training
 
+# Multi-Token Prediction (MTP): auxiliary heads predict t+2..t+K from the final
+# hidden state, adding a look-ahead training signal to the trunk (Gloeckle 2024 /
+# DeepSeek-V3). Head 0 (lm_head, t+1) is UNCHANGED -> val_bpb / inference / HF
+# export stay identical and comparable. Extra heads are light (n_embd->n_embd proj
+# + the SHARED lm_head) and discarded at inference. The aux loss is gated by a
+# progress schedule so we can test MTP as warmup, refinement, or throughout.
+MTP_ENABLE = True
+MTP_K = 2                # predict t+1 (head 0) .. t+K; K=2 adds one t+2 head (+0.26M params)
+MTP_WEIGHT = 0.3         # weight on each auxiliary CE term (DeepSeek-V3 uses ~0.3)
+MTP_SCHEDULE = "all"     # "all" (aux throughout) | "early" (aux until switch, then STP) | "late" (STP until switch, then aux)
+MTP_SWITCH_FRAC = 0.5    # progress at which "early"/"late" toggles the aux loss
+
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
@@ -569,6 +605,18 @@ def slw_seq_len(progress):
     stage = min(int(progress / SLW_WARMUP_FRAC * n_stages), n_stages - 1)
     return min(SLW_START * (2 ** stage), MAX_SEQ_LEN)
 
+def mtp_weight_sched(progress):
+    # MTP aux-loss weight by training phase. "all": on throughout. "early": on for
+    # the first MTP_SWITCH_FRAC (representation warmup), then pure single-token.
+    # "late": single-token first, aux on for the tail (late refinement).
+    if not MTP_ENABLE:
+        return 0.0
+    if MTP_SCHEDULE == "early":
+        return MTP_WEIGHT if progress < MTP_SWITCH_FRAC else 0.0
+    if MTP_SCHEDULE == "late":
+        return MTP_WEIGHT if progress >= MTP_SWITCH_FRAC else 0.0
+    return MTP_WEIGHT  # "all"
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -600,12 +648,13 @@ while True:
     torch.cuda.synchronize()
     t0 = time.time()
     seq_len = slw_seq_len(progress)  # current SLW context length (full once progress >= SLW_WARMUP_FRAC)
+    mtp_w = mtp_weight_sched(progress)  # current MTP aux-loss weight (0.0 = off this step)
     for micro_step in range(grad_accum_steps):
         # SLW: split each [B, MAX_SEQ_LEN] microbatch into shorter [.., seq_len] contexts
         # (same tokens, shorter attention window). Targets stay correctly next-token aligned.
         xb, yb = (x.view(-1, seq_len), y.view(-1, seq_len)) if seq_len < MAX_SEQ_LEN else (x, y)
         with autocast_ctx:
-            loss = model(xb, yb)
+            loss = model(xb, yb, mtp_weight=mtp_w)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
