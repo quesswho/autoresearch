@@ -35,9 +35,12 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import prepare
 
-WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)   # "has a real word?" check only
 def n_words(s):
-    return len(WORD_RE.findall(s))
+    # Budget metric = whitespace tokens, matching the competition's "10M words"
+    # count (wc -w). Do NOT use a letter-run regex here: it splits contractions
+    # ("don't" -> 2) and inflates the count well above the real budget.
+    return len(s.split())
 
 # --- per-source cleaning ----------------------------------------------------
 BRACKET = re.compile(r"\[[^\]]*\]")               # [leaves room.] CLAN comments/codes
@@ -101,10 +104,11 @@ def main():
     ap.add_argument("--dedup-min-words", type=int, default=4,
                     help="only dedup documents with >= this many words (protects short "
                          "naturally-frequent utterances); 0 = dedup everything")
-    ap.add_argument("--target-frac", type=float, default=1.0,
-                    help="after clean+dedup, refill each source back to this fraction of "
-                         "its ORIGINAL word count by uniformly cycling its unique docs "
-                         "(1.0 = original size & distribution at ~10M; 0 = no refill, leaner)")
+    ap.add_argument("--max-words", type=int, default=9_900_000,
+                    help="hard cap on total corpus size in whitespace words; the budget is "
+                         "split across sources by ORIGINAL proportion and each source is "
+                         "truncated or refilled (uniform doc cycling) to its share. Default "
+                         "9.9M = slightly under the competition's 10M limit.")
     ap.add_argument("--no-download", action="store_true", help="skip download (use cached raw)")
     ap.add_argument("--no-dedup", action="store_true", help="skip the dedup step")
     args = ap.parse_args()
@@ -113,18 +117,14 @@ def main():
         prepare.download_data()
     os.makedirs(args.out, exist_ok=True)
 
+    # Pass 1: clean + dedup each source, collecting unique docs and original sizes.
     seen = set()                  # global exact-dup detection (across all sources)
-    print(f"{'source':16} {'orig':>9} {'cleaned':>9} {'deduped':>9} {'refilled':>9} "
-          f"{'dup_docs':>8}")
-    tot_in = tot_clean = tot_dedup = tot_out = tot_dups = 0
-    comp = {}
+    per_source = {}               # fname -> {docs, wi, wclean, dups}
     for fname in prepare.BABYLM_FILES:
         clean_fn = CLEANERS[fname]
-        src = os.path.join(prepare.RAW_DIR, fname)
-        dst = os.path.join(args.out, fname)
         wi = wclean = dups = 0
-        docs = []                  # unique cleaned (+deduped) docs: (text, n_words)
-        with open(src, encoding="utf-8") as f:
+        docs = []                 # unique cleaned (+deduped) docs: (text, n_words)
+        with open(os.path.join(prepare.RAW_DIR, fname), encoding="utf-8") as f:
             for line in f:
                 line = line.rstrip("\n")
                 if not line.strip():
@@ -141,30 +141,41 @@ def main():
                         continue
                     seen.add(c)
                 docs.append((c, w))
+        per_source[fname] = dict(docs=docs, wi=wi, wclean=wclean, dups=dups)
+
+    # Budget: keep ORIGINAL source proportions, scaled so the TOTAL stays <= max_words
+    # (and never above the original size). Each source: truncate if over its share,
+    # refill (uniform cycling of unique docs) if under.
+    orig_total = sum(s["wi"] for s in per_source.values())
+    scale = min(1.0, args.max_words / orig_total)
+
+    print(f"{'source':16} {'orig':>9} {'cleaned':>9} {'deduped':>9} {'final':>9} {'dup_docs':>8}")
+    tot_in = tot_clean = tot_dedup = tot_out = tot_dups = 0
+    comp = {}
+    for fname in prepare.BABYLM_FILES:
+        s = per_source[fname]
+        docs, wi = s["docs"], s["wi"]
         wdedup = sum(w for _, w in docs)
-        # Refill to target by uniformly cycling the unique docs (light, even repetition
-        # instead of the original's concentrated redundancy).
-        target = int(wi * args.target_frac)
-        wout = wdedup
+        target = int(wi * scale)
+        wout = 0
         i = 0
-        with open(dst, "w", encoding="utf-8") as g:
-            for c, _ in docs:
-                g.write(c + "\n")
-            while wout < target and docs:
-                c, w = docs[i % len(docs)]
+        with open(os.path.join(args.out, fname), "w", encoding="utf-8") as g:
+            # write unique docs until target (truncate), then cycle to refill if short
+            while docs and wout < target:
+                c, w = docs[i] if i < len(docs) else docs[i % len(docs)]
                 g.write(c + "\n")
                 wout += w
                 i += 1
-        print(f"{fname.split('.')[0]:16} {wi:9d} {wclean:9d} {wdedup:9d} {wout:9d} {dups:8d}")
-        tot_in += wi; tot_clean += wclean; tot_dedup += wdedup; tot_out += wout; tot_dups += dups
+        print(f"{fname.split('.')[0]:16} {wi:9d} {s['wclean']:9d} {wdedup:9d} {wout:9d} {s['dups']:8d}")
+        tot_in += wi; tot_clean += s["wclean"]; tot_dedup += wdedup; tot_out += wout; tot_dups += s["dups"]
         comp[fname] = wout
 
-    print(f"\nTOTAL words: {tot_in:,} (orig) -> {tot_clean:,} (cleaned) -> {tot_dedup:,} (deduped) "
-          f"-> {tot_out:,} (refilled)")
-    print(f"  removed by cleaning: {tot_in - tot_clean:,}  |  removed by dedup: {tot_clean - tot_dedup:,} "
-          f"({tot_dups:,} duplicate docs)  |  refilled: {tot_out - tot_dedup:,}")
-    print(f"  final corpus: {tot_out:,} words  ({'UNDER' if tot_out <= 10_146_225 else 'OVER'} the "
-          f"original 10M-budget size)")
+    print(f"\nTOTAL words (whitespace, = competition metric):")
+    print(f"  {tot_in:,} (orig) -> {tot_clean:,} (cleaned) -> {tot_dedup:,} (deduped) -> {tot_out:,} (final)")
+    print(f"  removed by cleaning: {tot_in - tot_clean:,}  |  by dedup: {tot_clean - tot_dedup:,} "
+          f"({tot_dups:,} dup docs)  |  refilled net: {tot_out - tot_dedup:+,}")
+    ok = "OK, under 10M ✓" if tot_out < 10_000_000 else "*** OVER 10M ***"
+    print(f"  FINAL CORPUS: {tot_out:,} words  ({ok})")
     cz = sum(comp.values())
     print("\nfinal composition (word %):")
     for fname in prepare.BABYLM_FILES:
