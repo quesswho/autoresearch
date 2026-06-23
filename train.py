@@ -567,7 +567,7 @@ step = 0
 # the model bottoms mid-training (~epoch 6-7) then overfits; SWA recovers a flatter
 # minimum from the trajectory. RMSNorm is parameter-free (no BatchNorm running stats),
 # so no recalibration pass is needed after averaging.
-SWA_START = 0.5  # begin averaging once progress >= this fraction of training
+SWA_START = 0.7  # begin averaging once progress >= this fraction of training (0.5->0.7: underfit monotone curve, late epochs are best; center SWA on the flat low basin)
 swa_params = [torch.zeros_like(p, dtype=torch.float32) for p in model.parameters()]
 swa_count = 0
 
