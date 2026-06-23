@@ -101,6 +101,10 @@ def main():
     ap.add_argument("--dedup-min-words", type=int, default=4,
                     help="only dedup documents with >= this many words (protects short "
                          "naturally-frequent utterances); 0 = dedup everything")
+    ap.add_argument("--target-frac", type=float, default=1.0,
+                    help="after clean+dedup, refill each source back to this fraction of "
+                         "its ORIGINAL word count by uniformly cycling its unique docs "
+                         "(1.0 = original size & distribution at ~10M; 0 = no refill, leaner)")
     ap.add_argument("--no-download", action="store_true", help="skip download (use cached raw)")
     ap.add_argument("--no-dedup", action="store_true", help="skip the dedup step")
     args = ap.parse_args()
@@ -110,16 +114,17 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     seen = set()                  # global exact-dup detection (across all sources)
-    print(f"{'source':16} {'words_in':>9} {'cleaned':>9} {'deduped':>9} {'kept%':>6} "
+    print(f"{'source':16} {'orig':>9} {'cleaned':>9} {'deduped':>9} {'refilled':>9} "
           f"{'dup_docs':>8}")
-    tot_in = tot_clean = tot_out = tot_dups = 0
+    tot_in = tot_clean = tot_dedup = tot_out = tot_dups = 0
     comp = {}
     for fname in prepare.BABYLM_FILES:
         clean_fn = CLEANERS[fname]
         src = os.path.join(prepare.RAW_DIR, fname)
         dst = os.path.join(args.out, fname)
-        wi = wclean = wout = dups = 0
-        with open(src, encoding="utf-8") as f, open(dst, "w", encoding="utf-8") as g:
+        wi = wclean = dups = 0
+        docs = []                  # unique cleaned (+deduped) docs: (text, n_words)
+        with open(src, encoding="utf-8") as f:
             for line in f:
                 line = line.rstrip("\n")
                 if not line.strip():
@@ -135,17 +140,31 @@ def main():
                         dups += 1
                         continue
                     seen.add(c)
+                docs.append((c, w))
+        wdedup = sum(w for _, w in docs)
+        # Refill to target by uniformly cycling the unique docs (light, even repetition
+        # instead of the original's concentrated redundancy).
+        target = int(wi * args.target_frac)
+        wout = wdedup
+        i = 0
+        with open(dst, "w", encoding="utf-8") as g:
+            for c, _ in docs:
+                g.write(c + "\n")
+            while wout < target and docs:
+                c, w = docs[i % len(docs)]
                 g.write(c + "\n")
                 wout += w
-        kept = 100 * wout / max(wi, 1)
-        print(f"{fname.split('.')[0]:16} {wi:9d} {wclean:9d} {wout:9d} {kept:6.1f} {dups:8d}")
-        tot_in += wi; tot_clean += wclean; tot_out += wout; tot_dups += dups
+                i += 1
+        print(f"{fname.split('.')[0]:16} {wi:9d} {wclean:9d} {wdedup:9d} {wout:9d} {dups:8d}")
+        tot_in += wi; tot_clean += wclean; tot_dedup += wdedup; tot_out += wout; tot_dups += dups
         comp[fname] = wout
 
-    print(f"\nTOTAL words: {tot_in:,} (orig) -> {tot_clean:,} (cleaned) -> {tot_out:,} (deduped)")
-    print(f"  removed by cleaning: {tot_in - tot_clean:,}  |  removed by dedup: {tot_clean - tot_out:,} "
-          f"({tot_dups:,} duplicate docs)")
-    print(f"  final corpus: {tot_out:,} words  ({'UNDER' if tot_out <= 10_000_000 else 'OVER'} 10M budget)")
+    print(f"\nTOTAL words: {tot_in:,} (orig) -> {tot_clean:,} (cleaned) -> {tot_dedup:,} (deduped) "
+          f"-> {tot_out:,} (refilled)")
+    print(f"  removed by cleaning: {tot_in - tot_clean:,}  |  removed by dedup: {tot_clean - tot_dedup:,} "
+          f"({tot_dups:,} duplicate docs)  |  refilled: {tot_out - tot_dedup:,}")
+    print(f"  final corpus: {tot_out:,} words  ({'UNDER' if tot_out <= 10_146_225 else 'OVER'} the "
+          f"original 10M-budget size)")
     cz = sum(comp.values())
     print("\nfinal composition (word %):")
     for fname in prepare.BABYLM_FILES:
