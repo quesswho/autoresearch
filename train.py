@@ -509,7 +509,7 @@ SLW_WARMUP_FRAC = 0.5    # ramp SLW_START -> MAX_SEQ_LEN over the first this fra
 MTP_ENABLE = True
 MTP_K = 2                # predict t+1 (head 0) .. t+K; K=2 adds one t+2 head (+0.26M params)
 MTP_WEIGHT = 0.3         # weight on each auxiliary CE term (DeepSeek-V3 uses ~0.3)
-MTP_SCHEDULE = "all"     # "all" (aux throughout) | "early" (aux until switch, then STP) | "late" (STP until switch, then aux)
+MTP_SCHEDULE = "early"   # "all" (aux throughout) | "early" (aux until switch, then STP) | "late" (STP until switch, then aux)
 MTP_SWITCH_FRAC = 0.5    # progress at which "early"/"late" toggles the aux loss
 
 # ---------------------------------------------------------------------------
