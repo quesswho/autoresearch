@@ -469,6 +469,13 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 16  # per-device batch size (reduce if OOM)
 
+# Sequence Length Warmup (SLW): train on short contexts early, ramp to MAX_SEQ_LEN.
+# Each [DEVICE_BATCH_SIZE, MAX_SEQ_LEN] microbatch is reshaped to [.., T] so tokens/
+# step, epochs and budget are identical -- only the attention context window shrinks.
+SLW_ENABLE = True
+SLW_START = 256          # initial context length (power of 2 dividing MAX_SEQ_LEN)
+SLW_WARMUP_FRAC = 0.5    # ramp SLW_START -> MAX_SEQ_LEN over the first this fraction of training
+
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
@@ -553,6 +560,15 @@ def get_weight_decay(progress):
     # regularization in the back half exactly where the val curve overfits).
     return WEIGHT_DECAY
 
+def slw_seq_len(progress):
+    # Sequence Length Warmup: context length doubles from SLW_START to MAX_SEQ_LEN
+    # across [0, SLW_WARMUP_FRAC] of training, then stays at full length.
+    if not SLW_ENABLE or progress >= SLW_WARMUP_FRAC:
+        return MAX_SEQ_LEN
+    n_stages = int(math.log2(MAX_SEQ_LEN // SLW_START)) + 1
+    stage = min(int(progress / SLW_WARMUP_FRAC * n_stages), n_stages - 1)
+    return min(SLW_START * (2 ** stage), MAX_SEQ_LEN)
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -578,13 +594,18 @@ swa_count = 0
 current_epoch = epoch
 epoch_start_step = 0
 steps_per_epoch = None
+progress = 0.0  # updated each step; also drives the SLW schedule (uses prev step's value)
 
 while True:
     torch.cuda.synchronize()
     t0 = time.time()
+    seq_len = slw_seq_len(progress)  # current SLW context length (full once progress >= SLW_WARMUP_FRAC)
     for micro_step in range(grad_accum_steps):
+        # SLW: split each [B, MAX_SEQ_LEN] microbatch into shorter [.., seq_len] contexts
+        # (same tokens, shorter attention window). Targets stay correctly next-token aligned.
+        xb, yb = (x.view(-1, seq_len), y.view(-1, seq_len)) if seq_len < MAX_SEQ_LEN else (x, y)
         with autocast_ctx:
-            loss = model(x, y)
+            loss = model(xb, yb)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
