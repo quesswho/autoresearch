@@ -447,7 +447,10 @@ class MuonAdamW(torch.optim.Optimizer):
             state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
-        stacked_grads = torch.stack([p.grad for p in params])
+        # A param may have no grad this step (e.g. MTP projections during a phase
+        # where the aux loss is gated off); treat a missing grad as zero -> zero
+        # Newton-Schulz update for that param, leaving it effectively frozen.
+        stacked_grads = torch.stack([p.grad if p.grad is not None else torch.zeros_like(p) for p in params])
         stacked_params = torch.stack(params)
         self._muon_momentum_t.fill_(group["momentum"])
         self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
