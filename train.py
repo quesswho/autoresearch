@@ -510,8 +510,8 @@ SLW_WARMUP_FRAC = 0.5    # ramp SLW_START -> MAX_SEQ_LEN over the first this fra
 # + the SHARED lm_head) and discarded at inference. The aux loss is gated by a
 # progress schedule so we can test MTP as warmup, refinement, or throughout.
 MTP_ENABLE = True
-MTP_K = 2                # predict t+1 (head 0) .. t+K; K=2 adds one t+2 head (+0.26M params)
-MTP_WEIGHT = 0.3         # weight on each auxiliary CE term (sweep DONE: 0.1=1.31975, 0.3=1.31733 OPTIMUM, 0.5=1.32208; inverted-U)
+MTP_K = 3                # predict t+1 (head 0) .. t+K; K=3 adds t+2 AND t+3 heads (+0.52M params)
+MTP_WEIGHT = 0.15        # weight per aux head; K=3 -> 2 heads x 0.15 = 0.30 total aux (budget-matched to the K=2 optimum). K=2 sweep: 0.1=1.31975, 0.3=1.31733 OPT, 0.5=1.32208
 MTP_SCHEDULE = "all"     # "all" (aux throughout) | "early" (aux until switch, then STP) | "late" (STP until switch, then aux)
 MTP_SWITCH_FRAC = 0.5    # progress at which "early"/"late" toggles the aux loss
 
