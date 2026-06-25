@@ -111,6 +111,13 @@ def main():
                          "9.9M = slightly under the competition's 10M limit.")
     ap.add_argument("--no-download", action="store_true", help="skip download (use cached raw)")
     ap.add_argument("--no-dedup", action="store_true", help="skip the dedup step")
+    ap.add_argument("--no-clean", action="store_true",
+                    help="skip per-source cleaning (identity only) — isolates a composition/tilt "
+                         "change from the cleaning variable (orig-data best is on RAW text)")
+    ap.add_argument("--tilt", default="",
+                    help="comma-sep per-source multipliers on ORIGINAL word share, e.g. "
+                         "'gutenberg:1.4,simple_wiki:1.4,childes:0.75,open_subtitles:0.7'. "
+                         "Renormalized to --max-words; upweighted sources are cycled (repeated).")
     args = ap.parse_args()
 
     if not args.no_download:
@@ -121,7 +128,7 @@ def main():
     seen = set()                  # global exact-dup detection (across all sources)
     per_source = {}               # fname -> {docs, wi, wclean, dups}
     for fname in prepare.BABYLM_FILES:
-        clean_fn = CLEANERS[fname]
+        clean_fn = clean_identity if args.no_clean else CLEANERS[fname]
         wi = wclean = dups = 0
         docs = []                 # unique cleaned (+deduped) docs: (text, n_words)
         with open(os.path.join(prepare.RAW_DIR, fname), encoding="utf-8") as f:
@@ -146,8 +153,16 @@ def main():
     # Budget: keep ORIGINAL source proportions, scaled so the TOTAL stays <= max_words
     # (and never above the original size). Each source: truncate if over its share,
     # refill (uniform cycling of unique docs) if under.
-    orig_total = sum(s["wi"] for s in per_source.values())
-    scale = min(1.0, args.max_words / orig_total)
+    # Tilt: per-source multiplier on its ORIGINAL word share, renormalized so the
+    # TOTAL = max_words. Upweighted sources exceed their original size (doc cycling
+    # repeats them); downweighted sources are truncated. Empty --tilt = original mix.
+    tilt = {}
+    for kv in (args.tilt.split(",") if args.tilt else []):
+        k, v = kv.split(":"); tilt[k.strip()] = float(v)
+    def src_tilt(f):
+        return tilt.get(f.split(".")[0], 1.0)
+    weighted_total = sum(per_source[f]["wi"] * src_tilt(f) for f in prepare.BABYLM_FILES)
+    scale = args.max_words / weighted_total
 
     print(f"{'source':16} {'orig':>9} {'cleaned':>9} {'deduped':>9} {'final':>9} {'dup_docs':>8}")
     tot_in = tot_clean = tot_dedup = tot_out = tot_dups = 0
@@ -156,7 +171,7 @@ def main():
         s = per_source[fname]
         docs, wi = s["docs"], s["wi"]
         wdedup = sum(w for _, w in docs)
-        target = int(wi * scale)
+        target = int(wi * src_tilt(fname) * scale)
         wout = 0
         i = 0
         with open(os.path.join(args.out, fname), "w", encoding="utf-8") as g:
