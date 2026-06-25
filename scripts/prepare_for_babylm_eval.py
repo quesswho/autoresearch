@@ -79,6 +79,7 @@ class BabyLMConfig(PretrainedConfig):
         self.n_head = n_head
         self.n_kv_head = n_kv_head
         self.n_embd = n_embd
+        self.hidden_size = n_embd  # HF-standard alias (the GLUE finetune classifier reads config.hidden_size)
         self.window_pattern = window_pattern
         # lm_head is trained independently of wte; do not tie.
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -102,7 +103,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_utils import PreTrainedModel
-from transformers.modeling_outputs import CausalLMOutput
+from transformers.modeling_outputs import CausalLMOutput, BaseModelOutput
 
 from .configuration_babylm import BabyLMConfig
 
@@ -291,6 +292,26 @@ class BabyLMForCausalLM(PreTrainedModel):
             )
 
         return CausalLMOutput(loss=loss, logits=logits)
+
+
+class BabyLMModel(BabyLMForCausalLM):
+    """Base encoder (AutoModel): same backbone, returns last_hidden_state (n_embd)
+    instead of vocab logits. Used by the GLUE finetuning classifier, which reads
+    `last_hidden_state` and sizes its head to config.hidden_size."""
+
+    def forward(self, input_ids, attention_mask=None, return_dict=None, **kwargs):
+        idx = input_ids
+        B, T = idx.size()
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
+        x = self.transformer.wte(idx)
+        x = norm(x)
+        x0 = x
+        for i, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            x = block(x, ve, cos_sin, self.window_sizes[i])
+        x = norm(x)
+        return BaseModelOutput(last_hidden_state=x)
 '''
 
 
@@ -659,7 +680,7 @@ def convert(ckpt_path: str, out_dir: str, name: str):
         "architectures": ["BabyLMForCausalLM"],
         "auto_map": {
             "AutoConfig": "configuration_babylm.BabyLMConfig",
-            "AutoModel": "modeling_babylm.BabyLMForCausalLM",
+            "AutoModel": "modeling_babylm.BabyLMModel",
             "AutoModelForCausalLM": "modeling_babylm.BabyLMForCausalLM",
         },
         # lm_head is trained independently (NOT tied to wte); without this HF would
