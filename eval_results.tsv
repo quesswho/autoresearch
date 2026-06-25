@@ -1,6 +1,0 @@
-model	commit	corpus	blimp	supplement	ewok	entity_track	read_eye	read_spr	eval	notes
-best-7a24397	7a24397	original	69.03	57.20	51.09	41.49	0.04	0.01	fast	orig-data best (val_bpb 1.3266); baseline
-clean-40f87a0	40f87a0	clean+refill	69.25	54.00	51.55	26.27	0.23	0.01	fast	clean (strip noise) + refill-by-dup, NO dedup; wash vs orig (dropped supplement/entity)
-recon-9f654e1	9f654e1	clean+dedup+refill-9.86M	69.31	56.80	52.45	31.41	0.14	0.01	fast	reconstruct.py clean+dedup+refill; ~tie-to-slightly-better than orig; dedup recovered the clean+refill drops
-recon-final-49a4732	49a4732	clean+dedup+refill-9.9M(<10M)	69.61	57.20	52.82	21.37	0.08	0.04	fast	finalized <10M corpus (competition-compliant); BEST data variant on BLiMP+EWoK (+0.58/+1.73 vs orig); entity_track noisy
-slw-6068ae1	6068ae1	original+SLW	69.17	55.60	51.73	36.29	0.09	0.00	fast	SLW (ctx 256->2048 warmup) vs best-7a24397: BLiMP +0.14, EWoK +0.64 (both reliable up); supplement -1.6, entity noisy. val_bpb new best 1.3242. KEPT as new baseline.
